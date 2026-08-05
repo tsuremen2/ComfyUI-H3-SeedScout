@@ -4,6 +4,8 @@
 
 Scouts N seeds through just the first few steps of the full sigma schedule (a true "step 3 of 20", not a separate 3-step run), shows an animated preview per seed on the node, pauses until you click the seed you want, then continues that exact seed's latent through the remaining steps. One queued prompt, one full-quality result.
 
+<p align="center"><img src="docs/screenshot.png" width="420" alt="Seed Scout node waiting for selection with six seed previews"></p>
+
 ## Install
 
 ```
