@@ -40,7 +40,7 @@ Scouted seeds use the same noise as `RandomNoise`, so any seed also reproduces i
 ## Previews
 
 - `vae` (default): decodes previews with the real H3 video VAE. Efficient frame counts are 5, 22, 39, … 124; `preview_frames=124` at `preview_fps=24` previews full clips in real time.
-- `tae`: fast tiny-VAE previews via [Kijai's taeh3](https://huggingface.co/Kijai/MiniMax-H3-TAE) — place `taeh3.safetensors` in `models/vae_approx/` (option appears after restart; uses ComfyUI-KJNodes' decoder, so KJNodes must be installed). Also used automatically for the live previews while scouting.
+- `tae`: fast tiny-VAE previews from any tiny VAE in `models/vae_approx/` (option appears after restart; pick the file with the `tiny_vae` setting, default `auto`). Two H3 flavours are recognised automatically from the checkpoint: [Kijai's taeh3](https://huggingface.co/Kijai/MiniMax-H3-TAE) — 2D, one image per latent frame, decoded via ComfyUI-KJNodes (so KJNodes must be installed) — and [madebyollin's TAEHV](https://github.com/madebyollin/taehv), a temporal decoder that undoes H3's 4x time compression and gives full-fps previews. Also used for the live previews while scouting.
 - `latent2rgb`: free fallback, no extra files.
 
 ## Modes

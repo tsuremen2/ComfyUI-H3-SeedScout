@@ -340,61 +340,259 @@ def _save_preview(images: torch.Tensor, filename_prefix: str, seed: int, fps: in
     return {"filename": file, "subfolder": subfolder, "type": "output"}, animated, path, mime
 
 
-_TAE_DECODER = None
-_TAE_TRIED = False
+# ---------------------------------------------------------------------------
+# tiny VAE (tae) previews — generic over the known H3 flavours
+# ---------------------------------------------------------------------------
+#
+# Two very different checkpoints exist for H3, and they are told apart from the
+# STATE DICT, never the filename:
+#
+#   * Kijai's taeh3      — a flat nn.Sequential whose top-level keys are module
+#                          indices ("1.weight", "10.conv.0.weight", ...). 2D,
+#                          decodes one latent frame to one image, no temporal
+#                          decompression.
+#   * madebyollin TAEHV  — keys are namespaced "encoder."/"decoder.". Temporal:
+#                          undoes H3's 4x time compression and emits real pixel
+#                          frames at full fps.
+#
+# Both are exposed through the same tiny interface:
+#   .decode_video(latent_bcthw, num_frames) -> [T, H, W, 3] float 0..1 on cpu
+#   .temporal        True  -> output frames are pixel frames, play at preview_fps
+#                    False -> output frames are latent frames, play at fps/4
+#   .latent_channels 24 for H3 video; anything else is refused.
+
+_TAE_CACHE: dict[str, object] = {}
+_TAE_PREFERRED = ("taeh3.safetensors", "taeh3_taehv.safetensors")
+
+H3_VIDEO_LATENT_CHANNELS = 24
 
 
-def _get_tae_decoder():
-    """taeh3.safetensors from models/vae_approx via KJNodes' TinyVAEDecoder.
-
-    Imported by file path so we depend on the module, not on KJNodes' package
-    layout/registration. Returns None (once, with a warning) if unavailable.
-    """
-    global _TAE_DECODER, _TAE_TRIED
-    if _TAE_TRIED:
-        return _TAE_DECODER
-    _TAE_TRIED = True
+def _tae_candidates() -> list[str]:
+    """Every plausible tiny-VAE file in models/vae_approx (no filename semantics)."""
     try:
-        import importlib.util
-        kj_tiny = os.path.join(
-            os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-            "ComfyUI-KJNodes", "nodes", "tiny_vae.py",
-        )
-        spec = importlib.util.spec_from_file_location("h3ss_kj_tiny_vae", kj_tiny)
-        mod = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(mod)
-        dec = mod.load_tiny_vae_decoder("taeh3.safetensors")
-        if dec is not None and dec.latent_channels != 24:
-            LOG.warning("[H3SeedScout] taeh3 decodes %d-channel latents, H3 video is 24; "
-                        "ignoring it.", dec.latent_channels)
-            dec = None
-        _TAE_DECODER = dec
-        if dec is not None:
-            LOG.info("[H3SeedScout] taeh3 tiny VAE loaded (upscale %dx).", dec.upscale_ratio)
+        names = folder_paths.get_filename_list("vae_approx")
     except Exception:
-        LOG.exception("[H3SeedScout] could not load taeh3 tiny VAE")
-        _TAE_DECODER = None
-    return _TAE_DECODER
+        return []
+    return [n for n in names if n.lower().endswith((".safetensors", ".pth", ".pt"))]
 
 
-def _tae_preview_images(video_latent: torch.Tensor, num_frames: int) -> torch.Tensor:
-    """Per-latent-frame taeh3 decode: [B,C,T,H,W] -> [T',H,W,3] in 0..1.
+def _tae_choices() -> list[str]:
+    return ["auto"] + _tae_candidates()
 
-    2D per-frame decoder — no temporal 4x decompression, so T' is latent frames
-    (like latent2rgb). Play at fps/4 for ~real time.
+
+def _resolve_tae_name(name: str | None) -> str | None:
+    """'auto' -> first of the known-good names present, else the first candidate."""
+    candidates = _tae_candidates()
+    if not candidates:
+        return None
+    if name and name != "auto":
+        return name if name in candidates else None
+    for preferred in _TAE_PREFERRED:
+        if preferred in candidates:
+            return preferred
+    return candidates[0]
+
+
+class _KJTinyVAEDecoder:
+    """Kijai 2D taeh3, decoded by KJNodes' TinyVAEDecoder (imported by file path).
+
+    Per-latent-frame: output frame count == requested latent frame count.
     """
-    dec = _get_tae_decoder()
+
+    temporal = False
+
+    def __init__(self, inner):
+        self._inner = inner
+        self.latent_channels = inner.latent_channels
+        self.upscale_ratio = inner.upscale_ratio
+
+    def frames_for(self, num_frames: int, available_tokens: int) -> int:
+        return min(max(1, num_frames), available_tokens)
+
+    def decode_video(self, latent_bcthw: torch.Tensor, num_frames: int) -> torch.Tensor:
+        t = int(latent_bcthw.shape[2])
+        indices = None
+        if 0 < num_frames < t:
+            indices = ([round(i * (t - 1) / (num_frames - 1)) for i in range(num_frames)]
+                       if num_frames > 1 else [0])
+        out = self._inner.decode_video(latent_bcthw[:1], frame_indices=indices)
+        return out.clamp(0.0, 1.0).float().cpu()
+
+    def describe(self) -> str:
+        return "Kijai taeh3 (2D, {}x spatial, per-latent-frame)".format(self.upscale_ratio)
+
+
+class _TaehvDecoder:
+    """madebyollin TAEHV in H3 mode — a true temporal decoder.
+
+    Architecture is fixed from the checkpoint shapes, verified against
+    models/vae_approx/taeh3_taehv.safetensors:
+        decoder.1.weight  (256, 24, 3, 3) -> latent_channels 24, n_f[0]=256 (base arch)
+        decoder.22.weight (12,  64, 3, 3) -> 3 * patch_size**2 = 12 -> patch_size 2
+        decoder.{7,13,19}.conv.weight (256,256) (256,128) (128,64)
+            -> TGrow strides 1, 2, 2 -> decoder_time_upscale (False, True, True)
+            -> t_upscale = 4  (exactly H3's 4x temporal compression)
+    Spatial: 3 Upsample(2) * patch_size 2 = 16x, exactly H3's spacial_downscale_ratio.
+
+    NOTE ON is_h3: upstream sets `is_h3` by sniffing "taeh3" in the checkpoint PATH
+    and then load_state_dict()s via torch.load. We load safetensors ourselves, so we
+    build with checkpoint_path=None (passing the H3 geometry explicitly) and set
+    `is_h3` afterwards to enable `_decode_h3_video`'s 5-token/17-frame chunk trim.
+    """
+
+    temporal = True
+
+    def __init__(self, sd, device, dtype):
+        from . import taehv as _taehv
+
+        model = _taehv.TAEHV(
+            checkpoint_path=None,          # we load the weights ourselves
+            patch_size=2,
+            latent_channels=H3_VIDEO_LATENT_CHANNELS,
+            encoder_time_downscale=(True, True, False),
+            decoder_time_upscale=(False, True, True),
+            decoder_space_upscale=(True, True, True),
+        )
+        model.is_h3 = True                 # enables the H3 chunk/trim decode path
+        missing, unexpected = model.load_state_dict(
+            model.patch_tgrow_layers(dict(sd)), strict=False)
+        # the published checkpoint carries encoder+decoder; only the decoder must be whole
+        bad = [k for k in missing if k.startswith("decoder.")]
+        if bad:
+            raise RuntimeError("TAEHV checkpoint is missing decoder weights: {}".format(
+                bad[:4]))
+        if missing or unexpected:
+            LOG.debug("[H3SeedScout] TAEHV non-decoder key drift: %d missing, %d unexpected",
+                      len(missing), len(unexpected))
+
+        self._model = model.eval().to(device=device, dtype=dtype)
+        self._device = device
+        self._dtype = dtype
+        self.latent_channels = model.latent_channels
+        self.t_upscale = model.t_upscale             # 4
+        self.upscale_ratio = 8 * model.patch_size    # 16
+
+    # -- H3 chunk arithmetic, straight out of TAEHV._decode_h3_video ------------
+    # decoder emits 4T frames -> zero-pad to a multiple of 5*t_upscale (20)
+    # -> keep [3:] of each 20-frame chunk (17) -> drop the last 3*t_upscale (12).
+    # Keeping T a multiple of 5 means 4T is already a multiple of 20, so no zero
+    # frames are ever fabricated by that pad.
+
+    @staticmethod
+    def _out_frames(tokens: int) -> int:
+        return 17 * -(-tokens // 5) - 12
+
+    def tokens_for(self, num_frames: int, available_tokens: int) -> int:
+        """Smallest multiple-of-5 latent prefix that yields >= num_frames real frames."""
+        chunks = max(1, -(-(max(1, num_frames) + 12) // 17))
+        tokens = 5 * chunks
+        if tokens > available_tokens:
+            tokens = max(5, (available_tokens // 5) * 5)
+        return max(1, min(tokens, available_tokens))
+
+    def decode_video(self, latent_bcthw: torch.Tensor, num_frames: int) -> torch.Tensor:
+        available = int(latent_bcthw.shape[2])
+        tokens = self.tokens_for(num_frames, available)
+        # [B, C, T, H, W] -> NTCHW, which is what TAEHV operates on
+        x = latent_bcthw[:1, :, :tokens].permute(0, 2, 1, 3, 4).contiguous()
+        x = x.to(device=self._device, dtype=self._dtype)
+        # A trimmed prefix is small (usually 5-10 tokens), so the parallel path is both
+        # faster and comfortably sized; only fall back to the O(1)-memory sequential
+        # traversal for long prefixes, where parallel activations at 16x would spike.
+        parallel = tokens <= 15
+        with torch.inference_mode():
+            out = self._model.decode_video(x, parallel=parallel, show_progress_bar=False)
+        # NTCHW -> [T, H, W, 3]; TAEHV already clamps to 0..1
+        out = out[0].movedim(1, -1).float().cpu()
+        if 0 < num_frames < out.shape[0]:
+            out = out[:num_frames]
+        return out.clamp(0.0, 1.0)
+
+    def describe(self) -> str:
+        return "madebyollin TAEHV (temporal, {}x spatial, {}x temporal)".format(
+            self.upscale_ratio, self.t_upscale)
+
+
+def _load_kj_decoder(name):
+    """KJNodes' loader, imported by file path so we depend on the module, not the pack."""
+    import importlib.util
+    kj_tiny = os.path.join(
+        os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+        "ComfyUI-KJNodes", "nodes", "tiny_vae.py",
+    )
+    if not os.path.isfile(kj_tiny):
+        raise RuntimeError("ComfyUI-KJNodes' tiny_vae.py not found (needed for 2D taeh3)")
+    spec = importlib.util.spec_from_file_location("h3ss_kj_tiny_vae", kj_tiny)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    inner = mod.load_tiny_vae_decoder(name)
+    if inner is None:
+        raise RuntimeError("KJNodes could not load '{}'".format(name))
+    return _KJTinyVAEDecoder(inner)
+
+
+def _build_tae_decoder(name: str):
+    """Load `name` from vae_approx and wrap it; arch is detected from the state dict."""
+    import comfy.utils
+
+    path = folder_paths.get_full_path("vae_approx", name)
+    if path is None:
+        raise RuntimeError("'{}' not found in models/vae_approx".format(name))
+    sd = comfy.utils.load_torch_file(path, safe_load=True)
+
+    # --- architecture detection, from the keys only -------------------------
+    is_taehv = any(k.startswith("decoder.") for k in sd)
+    is_flat_2d = any(k.split(".")[0].isdigit() for k in sd)
+
+    if is_taehv:
+        device = comfy.model_management.vae_device()
+        dtype = comfy.model_management.vae_dtype(device, [torch.float16, torch.bfloat16])
+        dec = _TaehvDecoder(sd, device, dtype)
+    elif is_flat_2d:
+        dec = _load_kj_decoder(name)
+    else:
+        raise RuntimeError(
+            "'{}' is not a recognised tiny VAE (no 'decoder.' prefix and no flat "
+            "index keys)".format(name))
+
+    if dec.latent_channels != H3_VIDEO_LATENT_CHANNELS:
+        raise RuntimeError(
+            "'{}' decodes {}-channel latents, H3 video needs {}".format(
+                name, dec.latent_channels, H3_VIDEO_LATENT_CHANNELS))
+    return dec
+
+
+def _get_tae_decoder(name: str | None = "auto"):
+    """Cached per-file tiny-VAE decoder, or None (warning logged once per file)."""
+    resolved = _resolve_tae_name(name)
+    if resolved is None:
+        return None
+    if resolved in _TAE_CACHE:
+        return _TAE_CACHE[resolved]
+    try:
+        dec = _build_tae_decoder(resolved)
+        LOG.info("[H3SeedScout] tiny VAE '%s' loaded: %s", resolved, dec.describe())
+    except Exception as exc:
+        LOG.warning("[H3SeedScout] could not load tiny VAE '%s': %s", resolved, exc)
+        dec = None
+    _TAE_CACHE[resolved] = dec
+    return dec
+
+
+def _tae_preview_images(video_latent: torch.Tensor, num_frames: int,
+                        name: str | None = "auto"):
+    """[B,C,T,H,W] -> ([T',H,W,3] in 0..1, temporal: bool).
+
+    `temporal` says how to play the result back: True  -> full preview_fps
+    (real pixel frames), False -> preview_fps / 4 (one frame per latent frame).
+    """
+    dec = _get_tae_decoder(name)
     if dec is None:
-        raise RuntimeError("taeh3 tiny VAE unavailable; use preview_mode='vae' or 'latent2rgb'")
+        raise RuntimeError("no usable tiny VAE; use preview_mode='vae' or 'latent2rgb'")
     x = video_latent
     if x.ndim == 4:
         x = x.unsqueeze(2)
-    t = int(x.shape[2])
-    indices = None
-    if 0 < num_frames < t:
-        indices = [round(i * (t - 1) / (num_frames - 1)) for i in range(num_frames)] \
-            if num_frames > 1 else [0]
-    return dec.decode_video(x[:1], frame_indices=indices).clamp(0.0, 1.0).cpu()
+    return dec.decode_video(x, num_frames), dec.temporal
 
 
 def _encode_webp_b64(images: torch.Tensor, fps: int) -> str | None:
@@ -431,12 +629,9 @@ class MiniMaxH3SeedScoutSampler:
 
     @staticmethod
     def _preview_modes():
-        """'tae' is offered only when taeh3.safetensors is actually installed."""
-        try:
-            if "taeh3.safetensors" in folder_paths.get_filename_list("vae_approx"):
-                return list(PREVIEW_MODES)
-        except Exception:
-            pass
+        """'tae' is offered when ANY tiny-VAE candidate sits in models/vae_approx."""
+        if _tae_candidates():
+            return list(PREVIEW_MODES)
         return [m for m in PREVIEW_MODES if m != "tae"]
 
     @classmethod
@@ -462,6 +657,14 @@ class MiniMaxH3SeedScoutSampler:
                      "control_after_generate": True},
                 ),
                 "preview_mode": (cls._preview_modes(), {"default": "vae"}),
+                "tiny_vae": (
+                    _tae_choices(),
+                    {"default": "auto",
+                     "tooltip": "Which models/vae_approx file the 'tae' previews use. "
+                                "auto = taeh3.safetensors, else taeh3_taehv.safetensors, "
+                                "else the first candidate. madebyollin's TAEHV file is "
+                                "temporal (full-fps previews); Kijai's is per-latent-frame."},
+                ),
                 "preview_frames": ("INT", {"default": 8, "min": 1, "max": 512}),
                 "preview_fps": ("INT", {"default": 8, "min": 1, "max": 60}),
                 "max_preview_side": ("INT", {"default": 384, "min": 64, "max": 2048, "step": 16}),
@@ -580,7 +783,7 @@ class MiniMaxH3SeedScoutSampler:
     def run(self, guider, sampler, sigmas, latent_image, mode, seed_start, seed_count,
             seed_stride, scout_step, selected_seed, preview_mode, preview_frames,
             preview_fps, max_preview_side, filename_prefix, selection_timeout=0,
-            vae=None, unique_id=None):
+            tiny_vae="auto", vae=None, unique_id=None):
 
         if mode == "final":
             return self._run_final(guider, sampler, sigmas, latent_image, selected_seed)
@@ -590,6 +793,7 @@ class MiniMaxH3SeedScoutSampler:
             guider, sampler, sigmas, latent_image, seed_start, seed_count, seed_stride,
             scout_step, preview_mode, preview_frames, preview_fps, max_preview_side,
             filename_prefix, vae, interactive, int(selection_timeout or 0), unique_id,
+            tiny_vae,
         )
 
     def _run_final(self, guider, sampler, sigmas, latent_image, selected_seed):
@@ -610,7 +814,7 @@ class MiniMaxH3SeedScoutSampler:
     def _run_scout(self, guider, sampler, sigmas, latent_image, seed_start, seed_count,
                    seed_stride, scout_step, preview_mode, preview_frames, preview_fps,
                    max_preview_side, filename_prefix, vae, interactive, selection_timeout,
-                   unique_id):
+                   unique_id, tiny_vae="auto"):
         total_steps = int(sigmas.shape[-1]) - 1
         if total_steps < 1:
             raise ValueError("sigmas must contain at least 2 values")
@@ -624,8 +828,8 @@ class MiniMaxH3SeedScoutSampler:
                 "falling back to tae/latent2rgb."
             )
             preview_mode = "tae"
-        if preview_mode == "tae" and _get_tae_decoder() is None:
-            LOG.warning("[H3SeedScout] taeh3 not available; falling back to latent2rgb.")
+        if preview_mode == "tae" and _get_tae_decoder(tiny_vae) is None:
+            LOG.warning("[H3SeedScout] no usable tiny VAE; falling back to latent2rgb.")
             preview_mode = "latent2rgb"
         if not _PIL_OK:
             raise RuntimeError("Pillow is required for H3 Seed Scout previews")
@@ -674,17 +878,21 @@ class MiniMaxH3SeedScoutSampler:
                 # seed-by-seed; the proper VAE previews replace these after the loop.
                 if interactive:
                     try:
-                        # taeh3 tiny VAE if available (real colors, still ~free),
+                        # the selected tiny VAE if available (real colors, still ~free),
                         # else latent2rgb
-                        if _get_tae_decoder() is not None:
-                            prov = _tae_preview_images(preview_video, int(preview_frames))
+                        if _get_tae_decoder(tiny_vae) is not None:
+                            prov, prov_temporal = _tae_preview_images(
+                                preview_video, int(preview_frames), tiny_vae)
                         else:
                             prov = _latent2rgb_images(
                                 preview_video, latent_format, int(preview_frames))
+                            prov_temporal = False
                         prov = _downscale_images(prov, min(int(max_preview_side), 256))
-                        # latent frames are 4x temporally compressed vs pixel frames,
-                        # so quarter the fps to play the provisional at ~real time
-                        b64 = _encode_webp_b64(prov, max(1, int(preview_fps) // 4))
+                        # a temporal decoder emits real pixel frames (play at full fps);
+                        # per-latent-frame output is 4x time-compressed, so quarter it
+                        prov_fps = (int(preview_fps) if prov_temporal
+                                    else max(1, int(preview_fps) // 4))
+                        b64 = _encode_webp_b64(prov, prov_fps)
                         if b64:
                             _send(EVT_PREVIEW, {
                                 "node_id": node_id, "index": idx, "total": len(seeds),
@@ -721,9 +929,12 @@ class MiniMaxH3SeedScoutSampler:
                     images = _vae_preview_images(vae, video, int(preview_frames))
                     save_fps = int(preview_fps)
                 elif preview_mode == "tae":
-                    images = _tae_preview_images(video, int(preview_frames))
-                    # per-latent-frame decode: quarter fps for ~real-time playback
-                    save_fps = max(1, int(preview_fps) // 4)
+                    images, tae_temporal = _tae_preview_images(
+                        video, int(preview_frames), tiny_vae)
+                    # temporal decoder -> real pixel frames at full fps;
+                    # per-latent-frame decode -> quarter fps for ~real-time playback
+                    save_fps = (int(preview_fps) if tae_temporal
+                                else max(1, int(preview_fps) // 4))
                 else:
                     images = _latent2rgb_images(video, latent_format, int(preview_frames))
                     save_fps = max(1, int(preview_fps) // 4)
