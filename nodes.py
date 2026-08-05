@@ -789,9 +789,18 @@ class MiniMaxH3SeedScoutSampler:
         first_out = None
         first_denoised = None
         scouted = [e[0] for e in collected]
-        chosen, how = self._await_selection(
-            node_id, scouted, k, total_steps, selection_timeout, pushed
-        )
+        try:
+            chosen, how = self._await_selection(
+                node_id, scouted, k, total_steps, selection_timeout, pushed
+            )
+        except comfy.model_management.InterruptProcessingException:
+            # free the stored partial latents NOW — the traceback would otherwise
+            # keep this frame (and them) alive while the error is reported
+            for entry in collected:
+                entry[1] = None
+                entry[3] = None
+            collected = None
+            raise
         lines.append("  selection: seed {} ({})".format(chosen, how))
 
         # ---- 4. free the losers, continue the winner --------------------------
