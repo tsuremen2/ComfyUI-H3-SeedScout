@@ -236,3 +236,40 @@ Everything below was verified against **this** install
 * Unverified without a live run: the actual DOM widget rendering/sizing on frontend
   1.47.12, animated-WebP playback inside the node, the websocket round-trip, and real
   VRAM behaviour of the scout→block→continue sequence.
+
+## v2.1 additions
+
+### Clean node UI + ⚙ advanced settings
+Only `seed_start`, `seed_count`, `scout_step` and `selection_timeout` show as widgets
+on the node. Everything else (`mode`, `seed_stride`, `selected_seed`, `preview_mode`,
+`preview_frames`, `preview_fps`, `max_preview_side`, `filename_prefix`) is hidden for a
+clean look and editable through the **⚙** button next to *Continue ▶*. Hidden values
+still save/load with the workflow and remain fully settable in API-format JSON.
+
+### Live per-seed previews while scouting
+In interactive mode each seed pushes an instant provisional preview to the gallery the
+moment its scout steps finish, so you can start comparing seeds while later ones are
+still sampling. Seed buttons are always clickable for browsing; confirming is enabled
+only once all seeds are done and the node is waiting. After the loop, the proper
+`preview_mode` previews decode in one batch and replace the provisional ones in place.
+
+### taeh3 tiny VAE support (optional)
+If [Kijai's taeh3.safetensors](https://huggingface.co/Kijai/MiniMax-H3-TAE)
+(~10 MB) is installed at `models/vae_approx/taeh3.safetensors`, the node uses it
+automatically for the provisional live previews (real colors, still nearly free), and a
+third `preview_mode` option **`tae`** appears for using it as the final gallery decode
+too — fastest scouting, no 5 GB VAE load. Without the file, previews fall back to
+latent2rgb and the `tae` option is not offered. Loading reuses KJNodes'
+`TinyVAEDecoder` by file path (KJNodes must be installed for `tae`; everything else
+works without it).
+
+taeh3 is a 2D per-latent-frame decoder: it produces one frame per *latent* frame
+(4x temporally compressed), so tae/latent2rgb previews are saved at `preview_fps / 4`
+to play at approximately real time. Full-VAE previews play at `preview_fps` with all
+pixel frames.
+
+### Preview frame counts (vae mode)
+The H3 video VAE decodes efficient contiguous chunks of **5, 22, 39, 56, 73, 90, 107,
+124** frames. `preview_frames` values between chunk sizes cost the same as the next
+chunk up; set `preview_frames=124` + `preview_fps=24` to preview complete ~5 s clips in
+real time.

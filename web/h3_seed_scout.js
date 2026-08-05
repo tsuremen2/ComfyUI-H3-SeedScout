@@ -68,6 +68,17 @@ function ensureStyles() {
 .h3ss-continue:hover { background:#3a8850; }
 .h3ss-continue[disabled] { opacity:0.4; cursor:default; }
 .h3ss-hint { opacity:0.55; font-size:10px; }
+.h3ss-gear { flex:0 0 auto; padding:6px 10px; cursor:pointer; border-radius:4px;
+    background:#2b2b2b; border:1px solid #444; color:#ddd; }
+.h3ss-gear:hover { background:#3a3a3a; }
+.h3ss-settings { display:none; flex-direction:column; gap:4px; padding:6px;
+    background:#202020; border:1px solid #3a3a3a; border-radius:4px; }
+.h3ss-settings.open { display:flex; }
+.h3ss-set-row { display:flex; align-items:center; gap:6px; }
+.h3ss-set-row label { flex:1; opacity:0.8; font-size:11px; }
+.h3ss-set-row input, .h3ss-set-row select { flex:1; background:#181818;
+    border:1px solid #444; border-radius:3px; color:#ddd; font-size:11px;
+    padding:2px 4px; min-width:0; }
 `;
     document.head.appendChild(s);
 }
@@ -101,13 +112,58 @@ function makeUI(node, api) {
     cont.className = "h3ss-continue";
     cont.textContent = "Continue ▶";
     cont.disabled = true;
-    btnRow.appendChild(cont);
+    const gear = document.createElement("button");
+    gear.className = "h3ss-gear";
+    gear.textContent = "⚙";
+    gear.title = "advanced settings";
+    btnRow.append(cont, gear);
+
+    // advanced-settings popup: edits the node's hidden widgets in place
+    const settings = document.createElement("div");
+    settings.className = "h3ss-settings";
+    function buildSettings() {
+        settings.innerHTML = "";
+        for (const w of node.widgets || []) {
+            if (!w.hidden || w.name === "h3_seed_scout_ui") continue;
+            if (w.name === "control_after_generate") continue;
+            const row = document.createElement("div");
+            row.className = "h3ss-set-row";
+            const label = document.createElement("label");
+            label.textContent = w.name;
+            let field;
+            const opts = w.options && w.options.values;
+            if (Array.isArray(opts)) {
+                field = document.createElement("select");
+                for (const o of opts) {
+                    const el = document.createElement("option");
+                    el.value = el.textContent = o;
+                    if (o === w.value) el.selected = true;
+                    field.appendChild(el);
+                }
+                field.addEventListener("change", () => { w.value = field.value; });
+            } else {
+                field = document.createElement("input");
+                const numeric = typeof w.value === "number";
+                field.type = numeric ? "number" : "text";
+                field.value = w.value;
+                field.addEventListener("change", () => {
+                    w.value = numeric ? Number(field.value) : field.value;
+                });
+            }
+            row.append(label, field);
+            settings.appendChild(row);
+        }
+    }
+    gear.addEventListener("click", () => {
+        const open = settings.classList.toggle("open");
+        if (open) buildSettings();
+    });
 
     const hint = document.createElement("div");
     hint.className = "h3ss-hint";
     hint.textContent = "click a seed to preview · double-click or Continue to confirm";
 
-    root.append(status, stage, seedsRow, btnRow, hint);
+    root.append(status, stage, seedsRow, btnRow, settings, hint);
 
     const state = {
         root, status, stage, img, empty, seedsRow, cont,
@@ -167,7 +223,8 @@ function makeUI(node, api) {
     state.submit = submit;
 
     function setEnabled(on) {
-        for (const b of state.buttons.values()) b.disabled = !on;
+        // seed buttons always stay clickable for browsing previews;
+        // only the confirm/continue path is gated on the waiting state
         cont.disabled = !on;
     }
     state.setEnabled = setEnabled;
@@ -178,7 +235,6 @@ function makeUI(node, api) {
         if (!b) {
             b = document.createElement("button");
             b.className = "h3ss-seed";
-            b.disabled = !state.waiting;
             b.title = "seed " + seed;
             const label = document.createElement("span");
             label.textContent = "#" + (index + 1);
@@ -191,6 +247,8 @@ function makeUI(node, api) {
             state.buttons.set(seed, b);
             seedsRow.appendChild(b);
         }
+        // refresh the stage when a provisional preview is upgraded to the VAE one
+        if (state.selected === seed) img.src = url;
         if (state.selected === null) show(seed);
     }
     state.addSeed = addSeed;

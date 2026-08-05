@@ -46,7 +46,7 @@ except Exception:  # pragma: no cover - Pillow is always present in ComfyUI
 
 LOG = logging.getLogger("H3SeedScout")
 
-PREVIEW_MODES = ["vae", "latent2rgb"]
+PREVIEW_MODES = ["vae", "tae", "latent2rgb"]
 MODES = ["interactive", "scout", "final"]
 
 EVT_PREVIEW = "h3_seed_scout_preview"
@@ -342,6 +342,79 @@ def _save_preview(images: torch.Tensor, filename_prefix: str, seed: int, fps: in
     return {"filename": file, "subfolder": subfolder, "type": "output"}, animated, path, mime
 
 
+_TAE_DECODER = None
+_TAE_TRIED = False
+
+
+def _get_tae_decoder():
+    """taeh3.safetensors from models/vae_approx via KJNodes' TinyVAEDecoder.
+
+    Imported by file path so we depend on the module, not on KJNodes' package
+    layout/registration. Returns None (once, with a warning) if unavailable.
+    """
+    global _TAE_DECODER, _TAE_TRIED
+    if _TAE_TRIED:
+        return _TAE_DECODER
+    _TAE_TRIED = True
+    try:
+        import importlib.util
+        kj_tiny = os.path.join(
+            os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+            "ComfyUI-KJNodes", "nodes", "tiny_vae.py",
+        )
+        spec = importlib.util.spec_from_file_location("h3ss_kj_tiny_vae", kj_tiny)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        dec = mod.load_tiny_vae_decoder("taeh3.safetensors")
+        if dec is not None and dec.latent_channels != 24:
+            LOG.warning("[H3SeedScout] taeh3 decodes %d-channel latents, H3 video is 24; "
+                        "ignoring it.", dec.latent_channels)
+            dec = None
+        _TAE_DECODER = dec
+        if dec is not None:
+            LOG.info("[H3SeedScout] taeh3 tiny VAE loaded (upscale %dx).", dec.upscale_ratio)
+    except Exception:
+        LOG.exception("[H3SeedScout] could not load taeh3 tiny VAE")
+        _TAE_DECODER = None
+    return _TAE_DECODER
+
+
+def _tae_preview_images(video_latent: torch.Tensor, num_frames: int) -> torch.Tensor:
+    """Per-latent-frame taeh3 decode: [B,C,T,H,W] -> [T',H,W,3] in 0..1.
+
+    2D per-frame decoder — no temporal 4x decompression, so T' is latent frames
+    (like latent2rgb). Play at fps/4 for ~real time.
+    """
+    dec = _get_tae_decoder()
+    if dec is None:
+        raise RuntimeError("taeh3 tiny VAE unavailable; use preview_mode='vae' or 'latent2rgb'")
+    x = video_latent
+    if x.ndim == 4:
+        x = x.unsqueeze(2)
+    t = int(x.shape[2])
+    indices = None
+    if 0 < num_frames < t:
+        indices = [round(i * (t - 1) / (num_frames - 1)) for i in range(num_frames)] \
+            if num_frames > 1 else [0]
+    return dec.decode_video(x[:1], frame_indices=indices).clamp(0.0, 1.0).cpu()
+
+
+def _encode_webp_b64(images: torch.Tensor, fps: int) -> str | None:
+    """Encode [N,H,W,C] 0..1 frames to an in-memory animated WebP, base64'd."""
+    import io as _io
+    try:
+        frames = [Image.fromarray((f.numpy() * 255.0).clip(0, 255).astype("uint8"))
+                  for f in images]
+        buf = _io.BytesIO()
+        frames[0].save(buf, format="WEBP", save_all=True,
+                       duration=int(1000.0 / max(1, fps)),
+                       append_images=frames[1:], lossless=False, quality=70, method=2)
+        return base64.b64encode(buf.getvalue()).decode("ascii")
+    except Exception:  # pragma: no cover
+        LOG.exception("[H3SeedScout] provisional webp encode failed")
+        return None
+
+
 def _b64_file(path: str) -> str | None:
     try:
         with open(path, "rb") as fh:
@@ -357,6 +430,16 @@ def _b64_file(path: str) -> str | None:
 
 class MiniMaxH3SeedScoutSampler:
     """Seed-scouting / interactive sampler for MiniMax H3 (classic ComfyUI node API)."""
+
+    @staticmethod
+    def _preview_modes():
+        """'tae' is offered only when taeh3.safetensors is actually installed."""
+        try:
+            if "taeh3.safetensors" in folder_paths.get_filename_list("vae_approx"):
+                return list(PREVIEW_MODES)
+        except Exception:
+            pass
+        return [m for m in PREVIEW_MODES if m != "tae"]
 
     @classmethod
     def INPUT_TYPES(cls):
@@ -380,7 +463,7 @@ class MiniMaxH3SeedScoutSampler:
                     {"default": 0, "min": 0, "max": 0xFFFFFFFFFFFFFFFF,
                      "control_after_generate": True},
                 ),
-                "preview_mode": (PREVIEW_MODES, {"default": "vae"}),
+                "preview_mode": (cls._preview_modes(), {"default": "vae"}),
                 "preview_frames": ("INT", {"default": 8, "min": 1, "max": 512}),
                 "preview_fps": ("INT", {"default": 8, "min": 1, "max": 60}),
                 "max_preview_side": ("INT", {"default": 384, "min": 64, "max": 2048, "step": 16}),
@@ -540,8 +623,11 @@ class MiniMaxH3SeedScoutSampler:
         if preview_mode == "vae" and vae is None:
             LOG.warning(
                 "[H3SeedScout] preview_mode='vae' but no VAE connected; "
-                "falling back to latent2rgb."
+                "falling back to tae/latent2rgb."
             )
+            preview_mode = "tae"
+        if preview_mode == "tae" and _get_tae_decoder() is None:
+            LOG.warning("[H3SeedScout] taeh3 not available; falling back to latent2rgb.")
             preview_mode = "latent2rgb"
         if not _PIL_OK:
             raise RuntimeError("Pillow is required for H3 Seed Scout previews")
@@ -585,6 +671,32 @@ class MiniMaxH3SeedScoutSampler:
 
                 LOG.info("[H3SeedScout] seed %d/%d = %d  (%.1fs)",
                          idx + 1, len(seeds), seed, elapsed)
+
+                # Instant provisional preview (free latent2rgb) so the gallery fills
+                # seed-by-seed; the proper VAE previews replace these after the loop.
+                if interactive:
+                    try:
+                        # taeh3 tiny VAE if available (real colors, still ~free),
+                        # else latent2rgb
+                        if _get_tae_decoder() is not None:
+                            prov = _tae_preview_images(preview_video, int(preview_frames))
+                        else:
+                            prov = _latent2rgb_images(
+                                preview_video, latent_format, int(preview_frames))
+                        prov = _downscale_images(prov, min(int(max_preview_side), 256))
+                        # latent frames are 4x temporally compressed vs pixel frames,
+                        # so quarter the fps to play the provisional at ~real time
+                        b64 = _encode_webp_b64(prov, max(1, int(preview_fps) // 4))
+                        if b64:
+                            _send(EVT_PREVIEW, {
+                                "node_id": node_id, "index": idx, "total": len(seeds),
+                                "seed": seed, "elapsed": round(elapsed, 2),
+                                "mime": "image/webp", "image_b64": b64,
+                                "provisional": True,
+                            })
+                    except Exception:
+                        LOG.exception("[H3SeedScout] provisional preview failed")
+
                 del out, out_denoised, x0_out, preview_src
                 comfy.model_management.soft_empty_cache()
         except comfy.model_management.InterruptProcessingException:
@@ -609,11 +721,17 @@ class MiniMaxH3SeedScoutSampler:
             try:
                 if preview_mode == "vae":
                     images = _vae_preview_images(vae, video, int(preview_frames))
+                    save_fps = int(preview_fps)
+                elif preview_mode == "tae":
+                    images = _tae_preview_images(video, int(preview_frames))
+                    # per-latent-frame decode: quarter fps for ~real-time playback
+                    save_fps = max(1, int(preview_fps) // 4)
                 else:
                     images = _latent2rgb_images(video, latent_format, int(preview_frames))
+                    save_fps = max(1, int(preview_fps) // 4)
                 images = _downscale_images(images, int(max_preview_side))
                 ui_entry, animated, path, mime = _save_preview(
-                    images, filename_prefix, seed, int(preview_fps)
+                    images, filename_prefix, seed, save_fps
                 )
                 results.append(ui_entry)
                 animated_any = animated_any or animated
@@ -667,6 +785,9 @@ class MiniMaxH3SeedScoutSampler:
             }
 
         # ---- 3. block until the user picks a seed -----------------------------
+        # interactive returns the continued result, not the first seed's partial
+        first_out = None
+        first_denoised = None
         scouted = [e[0] for e in collected]
         chosen, how = self._await_selection(
             node_id, scouted, k, total_steps, selection_timeout, pushed
@@ -702,11 +823,10 @@ class MiniMaxH3SeedScoutSampler:
         LOG.info("[H3SeedScout] report:\n%s", report)
         _send(EVT_DONE, {"node_id": node_id, "seed": chosen, "status": "continued"})
 
-        ui = {"images": results}
-        if animated_any:
-            ui["animated"] = (True,) * len(results)
+        # Interactive mode: previews already live in the node's own gallery widget.
+        # Returning them in `ui` would stack ComfyUI's default image previews on top.
         return {
-            "ui": ui,
+            "ui": {"images": []},
             "result": (out, out_denoised, int(chosen), report),
         }
 
