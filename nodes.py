@@ -14,8 +14,6 @@ Three modes:
   return the first seed's partial latent. API/headless friendly.
 * ``final`` -- byte-for-byte stock ``SamplerCustomAdvanced`` on ``selected_seed``.
 
-Everything here is verified against THIS install
-(E:\\Stablediffusion\\ComfyUI_qwen); see README.md for the audit notes.
 """
 
 from __future__ import annotations
