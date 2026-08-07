@@ -362,7 +362,8 @@ def _save_preview(images: torch.Tensor, filename_prefix: str, seed: int, fps: in
 #   .latent_channels 24 for H3 video; anything else is refused.
 
 _TAE_CACHE: dict[str, object] = {}
-_TAE_PREFERRED = ("taeh3.safetensors", "taeh3_taehv.safetensors")
+# auto prefers the TAEHV file: temporal decode -> full-fps previews
+_TAE_PREFERRED = ("taeh3_taehv.safetensors", "taeh3.safetensors")
 
 H3_VIDEO_LATENT_CHANNELS = 24
 
