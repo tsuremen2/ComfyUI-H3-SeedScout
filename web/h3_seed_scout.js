@@ -323,6 +323,19 @@ function findNode(app, nodeId) {
                 return r;
             };
 
+            // Suppress ComfyUI's built-in sampling-preview overlay on THIS node only —
+            // it paints the live latent preview over our widget while sampling, and the
+            // node has its own (better) previews. app.nodePreviewImages is the store the
+            // canvas draws that overlay from; clearing our id each draw keeps it away.
+            const onDrawBackground = nodeType.prototype.onDrawBackground;
+            nodeType.prototype.onDrawBackground = function (ctx) {
+                try {
+                    const store = app.nodePreviewImages;
+                    if (store && store[String(this.id)]) delete store[String(this.id)];
+                } catch (e) { /* store shape changed — overlay just shows again */ }
+                return onDrawBackground ? onDrawBackground.apply(this, arguments) : undefined;
+            };
+
             const onRemoved = nodeType.prototype.onRemoved;
             nodeType.prototype.onRemoved = function () {
                 if (this.__h3ss) this.__h3ss.reset();
