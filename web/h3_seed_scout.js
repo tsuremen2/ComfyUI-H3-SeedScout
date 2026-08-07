@@ -323,19 +323,6 @@ function findNode(app, nodeId) {
                 return r;
             };
 
-            // Suppress ComfyUI's built-in sampling-preview overlay on THIS node only —
-            // it paints the live latent preview over our widget while sampling, and the
-            // node has its own (better) previews. app.nodePreviewImages is the store the
-            // canvas draws that overlay from; clearing our id each draw keeps it away.
-            const onDrawBackground = nodeType.prototype.onDrawBackground;
-            nodeType.prototype.onDrawBackground = function (ctx) {
-                try {
-                    const store = app.nodePreviewImages;
-                    if (store && store[String(this.id)]) delete store[String(this.id)];
-                } catch (e) { /* store shape changed — overlay just shows again */ }
-                return onDrawBackground ? onDrawBackground.apply(this, arguments) : undefined;
-            };
-
             const onRemoved = nodeType.prototype.onRemoved;
             nodeType.prototype.onRemoved = function () {
                 if (this.__h3ss) this.__h3ss.reset();
@@ -343,6 +330,37 @@ function findNode(app, nodeId) {
             };
         },
     });
+
+    // Periodic maintenance for all Seed Scout nodes. onDrawBackground never fires
+    // in this frontend's render path (and rAF suspends in hidden tabs), so a
+    // timer drives two things instead:
+    //  1. size the DOM panel from node.size — the frontend leaves the dom-widget
+    //     wrapper at 0x0, so without this the panel sizes to its content minimums
+    //     and ignores the node width entirely;
+    //  2. suppress ComfyUI's built-in sampling-preview overlay on these nodes
+    //     (app.nodePreviewImages) — the node has its own previews and the overlay
+    //     paints on top of the controls.
+    function maintainLoop() {
+        try {
+            const nodes = (app.graph && app.graph._nodes) || [];
+            for (const n of nodes) {
+                if (n.comfyClass !== NODE_CLASS || !n.__h3ss) continue;
+                const store = app.nodePreviewImages;
+                if (store && store[String(n.id)]) delete store[String(n.id)];
+                const w = n.widgets && n.widgets.find(x => x.name === "h3_seed_scout_ui");
+                const top = (w && w.last_y != null) ? w.last_y : 130;
+                const el = n.__h3ss.root;
+                const wpx = Math.max(200, Math.round(n.size[0] - 16));
+                const hpx = Math.max(160, Math.round(n.size[1] - top - 12));
+                if (el.__h3ssW !== wpx || el.__h3ssH !== hpx) {
+                    el.__h3ssW = wpx; el.__h3ssH = hpx;
+                    el.style.width = wpx + "px";
+                    el.style.height = hpx + "px";
+                }
+            }
+        } catch (e) { /* keep the loop alive */ }
+    }
+    setInterval(maintainLoop, 100);
 
     api.addEventListener("executing", (e) => {
         const nodeId = e.detail && (e.detail.node ?? e.detail);
